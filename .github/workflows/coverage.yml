@@ -1,0 +1,433 @@
+name: Code Coverage
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      coverage_threshold:
+        description: 'Minimum coverage threshold (%)'
+        required: false
+        default: '80'
+        type: choice
+        options:
+          - '70'
+          - '75'
+          - '80'
+          - '85'
+          - '90'
+
+concurrency:
+  group: reports-workflows
+  cancel-in-progress: false
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        # Install Playwright browsers for unit tests that might need them
+        playwright install chromium
+        playwright install-deps
+
+    - name: Run unit tests with coverage
+      run: |
+        # Run unit tests with coverage collection (without threshold check)
+        python -m pytest tests/unit/ \
+          --cov=framework \
+          --cov=tests/pages \
+          --cov-report=html:htmlcov \
+          --cov-report=xml:coverage.xml \
+          --cov-report=term-missing \
+          --cov-report=json:coverage.json \
+          -v || true
+
+        # Save test exit code
+        echo "TEST_EXIT_CODE=$?" >> $GITHUB_ENV
+      id: coverage_test
+
+    - name: Generate coverage report summary
+      if: always()
+      id: coverage_summary
+      run: |
+        # Ensure coverage.json exists (regenerate if needed)
+        if [ ! -f coverage.json ]; then
+          python -m coverage json -o coverage.json 2>/dev/null || true
+        fi
+
+        # Extract coverage percentage from JSON report
+        if [ -f coverage.json ]; then
+          COVERAGE_PERCENT=$(python -c "import json; data = json.load(open('coverage.json')); print(f\"{data['totals']['percent_covered']:.2f}\")")
+          echo "Coverage: ${COVERAGE_PERCENT}%"
+
+          # Set outputs for use in other steps
+          echo "coverage_percent=${COVERAGE_PERCENT}" >> $GITHUB_OUTPUT
+
+          # Check threshold
+          THRESHOLD=${{ github.event.inputs.coverage_threshold || '80' }}
+          COVERAGE_MET="false"
+          if (( $(echo "$COVERAGE_PERCENT >= $THRESHOLD" | bc -l) )); then
+            COVERAGE_MET="true"
+          fi
+
+          # Set outputs
+          echo "coverage_met=${COVERAGE_MET}" >> $GITHUB_OUTPUT
+          echo "threshold=${THRESHOLD}" >> $GITHUB_OUTPUT
+
+          # Create coverage summary for GitHub
+          echo "## Coverage Report 📊" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Coverage | ${COVERAGE_PERCENT}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| Threshold | ${THRESHOLD}% |" >> $GITHUB_STEP_SUMMARY
+
+          # Add status badge
+          if [ "$COVERAGE_MET" = "true" ]; then
+            echo "| Status | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Status | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Coverage by Module" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          python -m coverage report --skip-covered --skip-empty | tail -n +3 >> $GITHUB_STEP_SUMMARY || echo "No coverage data available" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Coverage data not available" >> $GITHUB_STEP_SUMMARY
+          echo "coverage_percent=0" >> $GITHUB_OUTPUT
+          echo "coverage_met=false" >> $GITHUB_OUTPUT
+          echo "threshold=${{ github.event.inputs.coverage_threshold || '80' }}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload coverage to Codecov
+      if: always()
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: ./coverage.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+        verbose: true
+      continue-on-error: true
+
+    - name: Prepare coverage report with metadata
+      if: always()
+      run: |
+        mkdir -p coverage-report
+
+        # Copy HTML report
+        if [ -d "htmlcov" ]; then
+          cp -r htmlcov/* coverage-report/
+        fi
+
+        # Create metadata.json with coverage percentage
+        COVERAGE_PERCENT="${{ steps.coverage_summary.outputs.coverage_percent || '0' }}"
+        THRESHOLD="${{ steps.coverage_summary.outputs.threshold || '80' }}"
+        COVERAGE_MET="${{ steps.coverage_summary.outputs.coverage_met || 'false' }}"
+
+        echo "{\"coverage\":$COVERAGE_PERCENT,\"threshold\":$THRESHOLD,\"coverage_met\":$COVERAGE_MET}" > coverage-report/metadata.json
+
+        echo "Created metadata with coverage: ${COVERAGE_PERCENT}%"
+
+    - name: Upload coverage report with metadata
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage-report/
+        retention-days: 30
+
+    - name: Upload coverage XML report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report-xml
+        path: coverage.xml
+        retention-days: 30
+
+    - name: Create coverage badge
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      run: |
+        if [ -f coverage.json ]; then
+          COVERAGE_PERCENT=$(python -c "import json; data = json.load(open('coverage.json')); print(f\"{data['totals']['percent_covered']:.0f}\")")
+
+          # Determine badge color based on coverage
+          if [ $COVERAGE_PERCENT -ge 90 ]; then
+            COLOR="brightgreen"
+          elif [ $COVERAGE_PERCENT -ge 80 ]; then
+            COLOR="green"
+          elif [ $COVERAGE_PERCENT -ge 70 ]; then
+            COLOR="yellow"
+          elif [ $COVERAGE_PERCENT -ge 60 ]; then
+            COLOR="orange"
+          else
+            COLOR="red"
+          fi
+
+          # Create badge JSON for shields.io
+          echo "{\"schemaVersion\": 1, \"label\": \"coverage\", \"message\": \"${COVERAGE_PERCENT}%\", \"color\": \"${COLOR}\"}" > coverage-badge.json
+        fi
+
+    - name: Comment PR with coverage
+      if: github.event_name == 'pull_request'
+      uses: py-cov-action/python-coverage-comment-action@v3
+      with:
+        GITHUB_TOKEN: ${{ github.token }}
+        MINIMUM_GREEN: 85
+        MINIMUM_ORANGE: 70
+        ANNOTATE_MISSING_LINES: true
+        ANNOTATION_TYPE: warning
+        VERBOSE: true
+      continue-on-error: true
+
+    - name: Check coverage threshold
+      if: always()
+      run: |
+        if [ "${{ steps.coverage_summary.outputs.coverage_met }}" = "false" ]; then
+          echo "❌ Coverage ${{ steps.coverage_summary.outputs.coverage_percent }}% is below the threshold of ${{ steps.coverage_summary.outputs.threshold }}%"
+          exit 1
+        else
+          echo "✅ Coverage ${{ steps.coverage_summary.outputs.coverage_percent }}% meets the threshold of ${{ steps.coverage_summary.outputs.threshold }}%"
+        fi
+
+  deploy-coverage:
+    needs: coverage
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Debug info
+      run: |
+        echo "🔍 Deploy Coverage Debug Info:"
+        echo "Branch: ${{ github.ref }}"
+        echo "Event: ${{ github.event_name }}"
+        echo "Repository: ${{ github.repository }}"
+        echo "Run number: ${{ github.run_number }}"
+
+    - name: Checkout pages templates
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          .github/pages-templates
+        sparse-checkout-cone-mode: false
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Download previous GitHub Pages artifact
+      continue-on-error: true
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+
+          console.log('🔍 Looking for latest github-pages artifact...');
+
+          // Get latest successful workflow runs that deployed pages
+          const workflows = await github.rest.actions.listRepoWorkflows({
+            owner: context.repo.owner,
+            repo: context.repo.repo
+          });
+
+          let latestArtifact = null;
+
+          // Search in both ui_tests.yml and coverage.yml workflows
+          for (const workflow of workflows.data.workflows) {
+            if (workflow.name === 'E2E Tests' || workflow.name === 'Code Coverage') {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflow.id,
+                status: 'completed',
+                per_page: 5
+              });
+
+              for (const run of runs.data.workflow_runs) {
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+
+                const pagesArtifact = artifacts.data.artifacts.find(a => a.name === 'github-pages');
+                if (pagesArtifact && (!latestArtifact || pagesArtifact.created_at > latestArtifact.created_at)) {
+                  latestArtifact = pagesArtifact;
+                }
+              }
+            }
+          }
+
+          if (latestArtifact) {
+            console.log(`✅ Found artifact from ${latestArtifact.created_at}`);
+
+            // Download artifact
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: latestArtifact.id,
+              archive_format: 'zip'
+            });
+
+            fs.writeFileSync('previous-site.zip', Buffer.from(download.data));
+            console.log('📥 Downloaded artifact');
+          } else {
+            console.log('⚠️  No previous artifact found (first deploy)');
+          }
+
+    - name: Extract previous site
+      continue-on-error: true
+      run: |
+        if [ -f "previous-site.zip" ]; then
+          echo "📦 Extracting previous site..."
+          unzip -q previous-site.zip -d previous-site || true
+
+          # The artifact contains a .tar file
+          if [ -f "previous-site/artifact.tar" ]; then
+            mkdir -p _site
+            tar -xf previous-site/artifact.tar -C _site
+            echo "✅ Extracted previous site"
+
+            echo ""
+            echo "📊 Previous site structure:"
+            ls -lah _site/ || true
+            echo ""
+            [ -d "_site/allure" ] && echo "✅ Allure: $(find _site/allure -type f 2>/dev/null | wc -l) files, $(du -sh _site/allure 2>/dev/null | cut -f1)" || echo "❌ No Allure"
+            [ -d "_site/coverage" ] && echo "✅ Coverage: $(find _site/coverage -type f 2>/dev/null | wc -l) files, $(du -sh _site/coverage 2>/dev/null | cut -f1)" || echo "❌ No Coverage"
+            [ -f "_site/metadata.json" ] && echo "✅ Metadata: $(cat _site/metadata.json)" || echo "❌ No metadata"
+          fi
+        else
+          echo "⚠️  No previous site to extract (first deploy)"
+          mkdir -p _site
+        fi
+
+    - name: Download Coverage Report artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-report
+        path: ./coverage-report
+      continue-on-error: true
+
+    - name: Replace Coverage report with fresh one
+      run: |
+        BUILD_NUM="${{ github.run_number }}"
+        BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+        if [ -d "./coverage-report" ] && [ -n "$(ls -A ./coverage-report 2>/dev/null)" ]; then
+          # Extract coverage percentage from metadata
+          COVERAGE_PCT=0
+          if [ -f "./coverage-report/metadata.json" ]; then
+            COVERAGE_PCT=$(jq -r '.coverage // 0' ./coverage-report/metadata.json)
+            echo "Coverage from metadata: ${COVERAGE_PCT}%"
+          fi
+
+          echo "🗑️  Removing old Coverage report..."
+          rm -rf _site/coverage
+
+          echo "📦 Installing fresh Coverage report for build #$BUILD_NUM"
+          mkdir -p _site/coverage
+          cp -r ./coverage-report/* _site/coverage/
+
+          echo "✅ Fresh Coverage report installed"
+        else
+          # Create placeholder
+          echo "⚠️  No Coverage artifact found, creating placeholder..."
+          mkdir -p _site/coverage
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          WORKFLOW_URL="$REPO_URL/actions/workflows/coverage.yml"
+          sed "s|{{WORKFLOW_URL}}|$WORKFLOW_URL|g" \
+            .github/pages-templates/coverage-redirect.html > _site/coverage/index.html
+        fi
+
+    - name: Ensure Allure report exists
+      run: |
+        if [ ! -d "_site/allure" ] || [ -z "$(ls -A _site/allure 2>/dev/null)" ]; then
+          echo "⚠️  No Allure directory found, creating placeholder..."
+          mkdir -p _site/allure
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          WORKFLOW_URL="$REPO_URL/actions/workflows/ui_tests.yml"
+          sed "s|{{WORKFLOW_URL}}|$WORKFLOW_URL|g" \
+            .github/pages-templates/allure-redirect.html > _site/allure/index.html
+        else
+          echo "✅ Allure report exists (preserved from download)"
+          ls -la _site/allure/ | head -10
+        fi
+
+    - name: Update unified metadata.json
+      run: |
+        BUILD_NUM="${{ github.run_number }}"
+        echo "📝 Updating unified metadata.json..."
+
+        # Get coverage percentage from artifact
+        COVERAGE_PCT=$(jq -r '.coverage // 0' ./coverage-report/metadata.json 2>/dev/null || echo "0")
+
+        # Read existing metadata and preserve allure section
+        ALLURE_SECTION=$(jq -c '.allure // {}' _site/metadata.json 2>/dev/null || echo '{}')
+
+        # Create new metadata with preserved allure section
+        jq -n \
+          --arg build "$BUILD_NUM" \
+          --arg coverage "$COVERAGE_PCT" \
+          --argjson allure "$ALLURE_SECTION" \
+          '{allure: $allure, coverage: {build: $build, coverage: ($coverage | tonumber)}}' \
+          > _site/metadata.json
+
+        echo "✅ Updated metadata.json:"
+        cat _site/metadata.json
+
+    - name: Generate main dashboard
+      run: |
+        echo "🎨 Generating dashboard..."
+        LAST_UPDATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+        # Read metadata
+        ALLURE_BUILD=$(jq -r '.allure.build // ""' _site/metadata.json 2>/dev/null || echo "")
+        COVERAGE_BUILD=$(jq -r '.coverage.build // ""' _site/metadata.json 2>/dev/null || echo "")
+        COVERAGE_PCT=$(jq -r '.coverage.coverage // 0' _site/metadata.json 2>/dev/null || echo "0")
+
+        # Build JSON arrays for template
+        ALLURE_BUILDS="[]"
+        [ -n "$ALLURE_BUILD" ] && [ "$ALLURE_BUILD" != "null" ] && ALLURE_BUILDS="[{\"number\":\"$ALLURE_BUILD\"}]"
+
+        COVERAGE_BUILDS="[]"
+        [ -n "$COVERAGE_BUILD" ] && [ "$COVERAGE_BUILD" != "null" ] && COVERAGE_BUILDS="[{\"number\":\"$COVERAGE_BUILD\",\"coverage\":$COVERAGE_PCT}]"
+
+        # Generate index.html
+        sed -e "s|{{LAST_UPDATE}}|$LAST_UPDATE|g" \
+            -e "s|{{ALLURE_BUILDS}}|$ALLURE_BUILDS|g" \
+            -e "s|{{COVERAGE_BUILDS}}|$COVERAGE_BUILDS|g" \
+          .github/pages-templates/index.html > _site/index.html
+
+        echo "✅ Dashboard generated (Allure: #$ALLURE_BUILD, Coverage: #$COVERAGE_BUILD ${COVERAGE_PCT}%)"
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Reports - Demo Actions</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 40px;
+            font-size: 2.5em;
+        }
+        .reports-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 30px;
+            margin-top: 40px;
+        }
+        .report-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-radius: 12px;
+            padding: 40px;
+            color: white;
+            text-align: center;
+            transition: transform 0.3s, box-shadow 0.3s;
+            cursor: pointer;
+        }
+        .report-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+        .report-card.coverage {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+        .report-icon {
+            font-size: 64px;
+            margin-bottom: 20px;
+        }
+        .report-title {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        .report-description {
+            font-size: 14px;
+            opacity: 0.9;
+            margin-bottom: 30px;
+        }
+        .report-button {
+            display: inline-block;
+            background: white;
+            color: #333;
+            padding: 12px 30px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: opacity 0.3s;
+        }
+        .report-button:hover {
+            opacity: 0.9;
+        }
+        .report-meta {
+            margin-top: 20px;
+            font-size: 13px;
+            opacity: 0.8;
+        }
+        .coverage-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 20px;
+            font-weight: 600;
+            margin-top: 10px;
+        }
+        .last-update {
+            text-align: center;
+            color: #6a737d;
+            margin-top: 40px;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 Test Reports Dashboard</h1>
+
+        <div class="reports-grid">
+            <!-- Allure Reports Card -->
+            <div class="report-card" id="allure-card">
+                <div class="report-icon">🧪</div>
+                <div class="report-title">Allure Test Reports</div>
+                <div class="report-description">Comprehensive E2E test execution reports with detailed steps and screenshots</div>
+                <a href="./allure/index.html" class="report-button">View Report</a>
+                <div class="report-meta" id="allure-meta"></div>
+            </div>
+
+            <!-- Coverage Reports Card -->
+            <div class="report-card coverage" id="coverage-card">
+                <div class="report-icon">📈</div>
+                <div class="report-title">Coverage Reports</div>
+                <div class="report-description">Unit test code coverage analysis with line-by-line metrics</div>
+                <a href="./coverage/index.html" class="report-button">View Report</a>
+                <div class="report-meta" id="coverage-meta"></div>
+            </div>
+        </div>
+
+        <div class="last-update">
+            Last updated: {{LAST_UPDATE}}
+        </div>
+    </div>
+
+    <script>
+        // Data injected by workflow
+        const allureBuilds = {{ALLURE_BUILDS}};
+        const coverageBuilds = {{COVERAGE_BUILDS}};
+
+        // Update Allure card
+        if (allureBuilds && allureBuilds.length > 0) {
+            const latest = allureBuilds[0];
+            document.getElementById('allure-meta').innerHTML = `<div>Build #${latest.number}</div>`;
+        }
+
+        // Update Coverage card
+        if (coverageBuilds && coverageBuilds.length > 0) {
+            const latest = coverageBuilds[0];
+            const coverage = latest.coverage || 0;
+            document.getElementById('coverage-meta').innerHTML = `
+                <div>Build #${latest.number}</div>
+                <div class="coverage-badge">${coverage}% Coverage</div>
+            `;
+        }
+    </script>
+</body>
+</html>

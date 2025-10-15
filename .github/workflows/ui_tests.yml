@@ -1,0 +1,412 @@
+name: E2E Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: 'Browser to run tests'
+        required: false
+        default: 'chromium'
+        type: choice
+        options:
+          - chromium
+          - firefox
+          - webkit
+      test_markers:
+        description: 'Pytest markers (e.g., "unit", "e2e", "unit and not slow", "smoke or e2e")'
+        required: false
+        default: ''
+        type: string
+      test_path:
+        description: 'Test path (e.g., "tests/", "tests/e2e/", "tests/e2e/login_test.py")'
+        required: false
+        default: 'tests/e2e/'
+        type: string
+      headed:
+        description: 'Run in headed mode'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: reports-workflows
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+        # Install selected browser
+        playwright install ${{ github.event.inputs.browser || 'chromium' }}
+        playwright install-deps
+
+        # Install Allure CLI for report generation
+        sudo apt-get update
+        sudo apt-get install -y openjdk-11-jdk
+        curl -o allure-commandline.tgz -Ls https://github.com/allure-framework/allure2/releases/download/2.24.1/allure-2.24.1.tgz
+        sudo tar -zxf allure-commandline.tgz -C /opt/
+        sudo ln -s /opt/allure-2.24.1/bin/allure /usr/bin/allure
+        allure --version
+
+    - name: Prepare test parameters
+      id: test_params
+      run: |
+        # Set test path (default to tests/e2e/ if not specified)
+        TEST_PATH="${{ github.event.inputs.test_path || 'tests/e2e/' }}"
+        echo "test_path=${TEST_PATH}" >> $GITHUB_OUTPUT
+        echo "Test path: ${TEST_PATH}"
+
+        # Set pytest markers if specified
+        MARKERS="${{ github.event.inputs.test_markers }}"
+        if [ -n "$MARKERS" ]; then
+          echo "marker_flag=-m \"${MARKERS}\"" >> $GITHUB_OUTPUT
+          echo "Using markers: ${MARKERS}"
+        else
+          echo "marker_flag=" >> $GITHUB_OUTPUT
+          echo "Running all tests (no markers filter)"
+        fi
+
+        # Set headed/headless mode
+        if [ "${{ github.event.inputs.headed }}" = "true" ]; then
+          echo "headed_flag=--headed" >> $GITHUB_OUTPUT
+          echo "Running in headed mode"
+        else
+          echo "headed_flag=" >> $GITHUB_OUTPUT
+          echo "Running in headless mode"
+        fi
+
+        # Display available markers for reference
+        echo ""
+        echo "📌 Available test markers in this project:"
+        echo "  - unit: Unit tests"
+        echo "  - e2e: End-to-end tests"
+        echo "  - slow: Slow running tests"
+        echo ""
+        echo "💡 Examples of marker expressions:"
+        echo "  - 'unit' - run only unit tests"
+        echo "  - 'e2e' - run only e2e tests"
+        echo "  - 'not slow' - run all except slow tests"
+        echo "  - 'unit and not slow' - run fast unit tests"
+        echo "  - 'e2e or smoke' - run e2e or smoke tests"
+
+    - name: Run tests
+      env:
+        OREO_LOGIN: ${{ secrets.OREO_LOGIN }}
+        OREO_PASS: ${{ secrets.OREO_PASS }}
+      run: |
+        # Clean previous Allure results to avoid mixing test runs
+        rm -rf allure-results
+        mkdir -p allure-results
+
+        # Build pytest command
+        CMD="python -m pytest ${{ steps.test_params.outputs.test_path }}"
+
+        # Add markers if specified
+        if [ -n "${{ steps.test_params.outputs.marker_flag }}" ]; then
+          CMD="$CMD ${{ steps.test_params.outputs.marker_flag }}"
+        fi
+
+        # Add browser and other flags
+        CMD="$CMD --browser ${{ github.event.inputs.browser || 'chromium' }}"
+        CMD="$CMD ${{ steps.test_params.outputs.headed_flag }}"
+        CMD="$CMD --alluredir=allure-results -v"
+
+        # Display the command that will be executed
+        echo "Executing: $CMD"
+        echo ""
+
+        # Run tests
+        eval $CMD || true
+
+        # Save test exit code
+        echo "TEST_EXIT_CODE=$?" >> $GITHUB_ENV
+
+    - name: Generate test summary
+      if: always()
+      run: |
+        echo "## Test Execution Summary 🧪" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Browser | ${{ github.event.inputs.browser || 'chromium' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Path | ${{ github.event.inputs.test_path || 'tests/e2e/' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Markers | ${{ github.event.inputs.test_markers || 'None (all tests)' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Mode | ${{ github.event.inputs.headed == 'true' && 'Headed' || 'Headless' }} |" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$TEST_EXIT_CODE" = "0" ]; then
+          echo "| Result | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Result | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Test Details" >> $GITHUB_STEP_SUMMARY
+        echo "Check the Allure report artifact for detailed results." >> $GITHUB_STEP_SUMMARY
+
+    - name: Generate Allure Report
+      if: always()
+      run: |
+        echo "📊 Generating Allure report from test results..."
+        echo "Test results found:"
+        ls -la allure-results/ | head -20
+        echo ""
+        echo "Total test result files: $(ls allure-results/*.json 2>/dev/null | wc -l)"
+
+        allure generate allure-results --clean -o allure-report
+
+        echo ""
+        echo "Report generated. Checking report contents:"
+        echo "Total test cases in report: $(ls allure-report/data/test-cases/*.json 2>/dev/null | wc -l)"
+        echo "Report size: $(du -sh allure-report | cut -f1)"
+
+    - name: Upload Allure Report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: allure-report
+        path: allure-report/
+        retention-days: 30
+
+    - name: Upload test screenshots
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: screenshots-${{ github.event.inputs.browser || 'chromium' }}
+        path: |
+          screenshots/
+          *.png
+        if-no-files-found: ignore
+        retention-days: 7
+
+    - name: Check test results
+      if: env.TEST_EXIT_CODE != '0'
+      run: |
+        echo "❌ Tests failed with exit code $TEST_EXIT_CODE"
+        exit 1
+
+  deploy-allure:
+    needs: test
+    if: always() && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+      actions: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Debug info
+      run: |
+        echo "🔍 Deploy Allure Debug Info:"
+        echo "Branch: ${{ github.ref }}"
+        echo "Event: ${{ github.event_name }}"
+        echo "Repository: ${{ github.repository }}"
+        echo "Run number: ${{ github.run_number }}"
+
+    - name: Checkout pages templates
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          .github/pages-templates
+        sparse-checkout-cone-mode: false
+
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+
+    - name: Download previous GitHub Pages artifact
+      continue-on-error: true
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+
+          console.log('🔍 Looking for latest github-pages artifact...');
+
+          // Get latest successful workflow runs that deployed pages
+          const workflows = await github.rest.actions.listRepoWorkflows({
+            owner: context.repo.owner,
+            repo: context.repo.repo
+          });
+
+          let latestArtifact = null;
+
+          // Search in both ui_tests.yml and coverage.yml workflows
+          for (const workflow of workflows.data.workflows) {
+            if (workflow.name === 'E2E Tests' || workflow.name === 'Code Coverage') {
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflow.id,
+                status: 'completed',
+                per_page: 5
+              });
+
+              for (const run of runs.data.workflow_runs) {
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  run_id: run.id
+                });
+
+                const pagesArtifact = artifacts.data.artifacts.find(a => a.name === 'github-pages');
+                if (pagesArtifact && (!latestArtifact || pagesArtifact.created_at > latestArtifact.created_at)) {
+                  latestArtifact = pagesArtifact;
+                }
+              }
+            }
+          }
+
+          if (latestArtifact) {
+            console.log(`✅ Found artifact from ${latestArtifact.created_at}`);
+
+            // Download artifact
+            const download = await github.rest.actions.downloadArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: latestArtifact.id,
+              archive_format: 'zip'
+            });
+
+            fs.writeFileSync('previous-site.zip', Buffer.from(download.data));
+            console.log('📥 Downloaded artifact');
+          } else {
+            console.log('⚠️  No previous artifact found (first deploy)');
+          }
+
+    - name: Extract previous site
+      continue-on-error: true
+      run: |
+        if [ -f "previous-site.zip" ]; then
+          echo "📦 Extracting previous site..."
+          unzip -q previous-site.zip -d previous-site || true
+
+          # The artifact contains a .tar file
+          if [ -f "previous-site/artifact.tar" ]; then
+            mkdir -p _site
+            tar -xf previous-site/artifact.tar -C _site
+            echo "✅ Extracted previous site"
+
+            echo ""
+            echo "📊 Previous site structure:"
+            ls -lah _site/ || true
+            echo ""
+            [ -d "_site/allure" ] && echo "✅ Allure: $(find _site/allure -type f 2>/dev/null | wc -l) files, $(du -sh _site/allure 2>/dev/null | cut -f1)" || echo "❌ No Allure"
+            [ -d "_site/coverage" ] && echo "✅ Coverage: $(find _site/coverage -type f 2>/dev/null | wc -l) files, $(du -sh _site/coverage 2>/dev/null | cut -f1)" || echo "❌ No Coverage"
+            [ -f "_site/metadata.json" ] && echo "✅ Metadata: $(cat _site/metadata.json)" || echo "❌ No metadata"
+          fi
+        else
+          echo "⚠️  No previous site to extract (first deploy)"
+          mkdir -p _site
+        fi
+
+    - name: Download Allure Report artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: allure-report
+        path: ./allure-report
+      continue-on-error: true
+
+    - name: Replace Allure report with fresh one
+      run: |
+        BUILD_NUM="${{ github.run_number }}"
+        BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+        if [ -d "./allure-report" ] && [ -n "$(ls -A ./allure-report 2>/dev/null)" ]; then
+          echo "🗑️  Removing old Allure report..."
+          rm -rf _site/allure
+
+          echo "📦 Installing fresh Allure report for build #$BUILD_NUM"
+          mkdir -p _site/allure
+          cp -r ./allure-report/* _site/allure/
+
+          echo "✅ Fresh Allure report installed"
+        else
+          # Create placeholder
+          echo "⚠️  No Allure artifact found, creating placeholder..."
+          mkdir -p _site/allure
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          WORKFLOW_URL="$REPO_URL/actions/workflows/ui_tests.yml"
+          sed "s|{{WORKFLOW_URL}}|$WORKFLOW_URL|g" \
+            .github/pages-templates/allure-redirect.html > _site/allure/index.html
+        fi
+
+    - name: Ensure Coverage report exists
+      run: |
+        if [ ! -d "_site/coverage" ] || [ -z "$(ls -A _site/coverage 2>/dev/null)" ]; then
+          echo "⚠️  No Coverage directory found, creating placeholder..."
+          mkdir -p _site/coverage
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          WORKFLOW_URL="$REPO_URL/actions/workflows/coverage.yml"
+          sed "s|{{WORKFLOW_URL}}|$WORKFLOW_URL|g" \
+            .github/pages-templates/coverage-redirect.html > _site/coverage/index.html
+        else
+          echo "✅ Coverage report exists (preserved from download)"
+          ls -la _site/coverage/ | head -10
+        fi
+
+    - name: Update unified metadata.json
+      run: |
+        BUILD_NUM="${{ github.run_number }}"
+        echo "📝 Updating unified metadata.json..."
+
+        # Read existing metadata and preserve coverage section
+        COVERAGE_SECTION=$(jq -c '.coverage // {}' _site/metadata.json 2>/dev/null || echo '{}')
+
+        # Create new metadata with updated allure section
+        jq -n \
+          --arg build "$BUILD_NUM" \
+          --argjson coverage "$COVERAGE_SECTION" \
+          '{allure: {build: $build}, coverage: $coverage}' \
+          > _site/metadata.json
+
+        echo "✅ Updated metadata.json:"
+        cat _site/metadata.json
+
+    - name: Generate main dashboard
+      run: |
+        echo "🎨 Generating dashboard..."
+        LAST_UPDATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+        # Read metadata
+        ALLURE_BUILD=$(jq -r '.allure.build // ""' _site/metadata.json 2>/dev/null || echo "")
+        COVERAGE_BUILD=$(jq -r '.coverage.build // ""' _site/metadata.json 2>/dev/null || echo "")
+        COVERAGE_PCT=$(jq -r '.coverage.coverage // 0' _site/metadata.json 2>/dev/null || echo "0")
+
+        # Build JSON arrays for template
+        ALLURE_BUILDS="[]"
+        [ -n "$ALLURE_BUILD" ] && [ "$ALLURE_BUILD" != "null" ] && ALLURE_BUILDS="[{\"number\":\"$ALLURE_BUILD\"}]"
+
+        COVERAGE_BUILDS="[]"
+        [ -n "$COVERAGE_BUILD" ] && [ "$COVERAGE_BUILD" != "null" ] && COVERAGE_BUILDS="[{\"number\":\"$COVERAGE_BUILD\",\"coverage\":$COVERAGE_PCT}]"
+
+        # Generate index.html
+        sed -e "s|{{LAST_UPDATE}}|$LAST_UPDATE|g" \
+            -e "s|{{ALLURE_BUILDS}}|$ALLURE_BUILDS|g" \
+            -e "s|{{COVERAGE_BUILDS}}|$COVERAGE_BUILDS|g" \
+          .github/pages-templates/index.html > _site/index.html
+
+        echo "✅ Dashboard generated (Allure: #$ALLURE_BUILD, Coverage: #$COVERAGE_BUILD ${COVERAGE_PCT}%)"
+
+    - name: Upload artifact
+      uses: actions/upload-pages-artifact@v3
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
